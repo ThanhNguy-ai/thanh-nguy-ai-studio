@@ -3,6 +3,7 @@ from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 import tempfile, subprocess, asyncio, textwrap, json, random, os
 import imageio_ffmpeg
+import requests, io, re
 
 st.set_page_config(page_title='Thanh Nguy AI Studio',page_icon='🎬',layout='centered')
 st.markdown('''<style>.block-container{max-width:680px;padding-top:1.4rem} .stButton button{min-height:3.3rem;border-radius:12px} h1{font-size:1.8rem!important}</style>''',unsafe_allow_html=True)
@@ -17,6 +18,7 @@ with st.form('video'):
     voice=st.selectbox('🎙️ Giọng đọc',['vi-VN-HoaiMyNeural','vi-VN-NamMinhNeural'],format_func=lambda v:'Nữ - Hoài My' if 'Hoai' in v else 'Nam - Nam Minh')
     mode=st.radio('📝 Nội dung', ['Tự tạo bản nháp theo chủ đề','Tôi tự nhập lời đọc'],horizontal=False)
     custom=st.text_area('Lời đọc (nếu tự nhập)',height=140) if mode=='Tôi tự nhập lời đọc' else ''
+    photos=st.file_uploader('🖼️ Ảnh minh họa (chọn 1–8 ảnh, tùy chọn)',type=['jpg','jpeg','png','webp'],accept_multiple_files=True,help='Ảnh em chọn sẽ được dùng làm cảnh video. Nếu không chọn, ứng dụng thử tìm ảnh trên Wikimedia Commons.')
     submitted=st.form_submit_button('✨ TẠO VIDEO MP4',use_container_width=True)
 
 TEMPLATES={
@@ -33,33 +35,70 @@ def font_path():
         if Path(p).exists():return p
     return None
 
-def frame(path, title, subtitle, idx, total):
+def commons_image(query):
+    """Best-effort openly licensed photo search; never pretend generated AI imagery."""
+    api='https://commons.wikimedia.org/w/api.php'
+    headers={'User-Agent':'ThanhNguyAIStudio/2.0 (educational prototype)'}
+    try:
+        r=requests.get(api,params={'action':'query','generator':'search','gsrsearch':query+' filetype:bitmap','gsrnamespace':6,'gsrlimit':8,'prop':'imageinfo','iiprop':'url|mime|extmetadata','iiurlwidth':900,'format':'json'},headers=headers,timeout=12)
+        r.raise_for_status()
+        pages=r.json().get('query',{}).get('pages',{})
+        for page in pages.values():
+            for info in page.get('imageinfo',[]):
+                url=info.get('thumburl') or info.get('url','')
+                if info.get('mime','').startswith('image/') and url:
+                    data=requests.get(url,headers=headers,timeout=15)
+                    data.raise_for_status()
+                    im=Image.open(io.BytesIO(data.content)).convert('RGB')
+                    if min(im.size)>=300:
+                        meta=info.get('extmetadata',{})
+                        return im,{'source':info.get('descriptionurl',url),'license':re.sub('<[^>]*>','',meta.get('LicenseShortName',{}).get('value','Xem trang nguồn'))}
+    except Exception:
+        pass
+    return None,None
+
+def frame(path,title,subtitle,idx,total,photo=None):
     w,h=720,1280
-    palettes=[((15,29,52),(38,82,102)),((41,31,64),(93,58,97)),((19,52,55),(30,107,91)),((59,35,41),(130,79,64))]
-    c1,c2=palettes[idx%len(palettes)]
-    im=Image.new('RGB',(w,h)); px=im.load()
-    for y in range(h):
-        a=y/h; col=tuple(int(c1[i]*(1-a)+c2[i]*a) for i in range(3))
-        ImageDraw.Draw(im).line([(0,y),(w,y)],fill=col)
+    if photo is not None:
+        im=photo.convert('RGB')
+        iw,ih=im.size
+        factor=max(w/iw,h/ih)
+        nw,nh=round(iw*factor),round(ih*factor)
+        im=im.resize((nw,nh),Image.Resampling.LANCZOS)
+        left=(nw-w)//2; top=(nh-h)//2
+        im=im.crop((left,top,left+w,top+h))
+    else:
+        im=Image.new('RGB',(w,h),(37,45,62))
+        d=ImageDraw.Draw(im)
+        for y in range(h):
+            d.line((0,y,w,y),fill=(25+int(y/h*32),36+int(y/h*23),55+int(y/h*15)))
+    overlay=Image.new('RGBA',(w,h),(0,0,0,0))
+    od=ImageDraw.Draw(overlay)
+    od.rectangle((0,790,w,h),fill=(0,0,0,155))
+    od.rectangle((0,0,w,140),fill=(0,0,0,95))
+    im=Image.alpha_composite(im.convert('RGBA'),overlay)
     d=ImageDraw.Draw(im)
-    d.ellipse((90,155,630,695),outline=(255,216,155),width=5)
-    d.ellipse((130,195,590,655),outline=(255,216,155),width=2)
-    fp=font_path(); ft=ImageFont.truetype(fp,43) if fp else ImageFont.load_default(); fs=ImageFont.truetype(fp,30) if fp else ImageFont.load_default()
-    def wrap(s,limit=23):
-        words=s.split(); out=[]; line=''
+    fp=font_path()
+    ft=ImageFont.truetype(fp,43) if fp else ImageFont.load_default()
+    fs=ImageFont.truetype(fp,23) if fp else ImageFont.load_default()
+    def wrap(s,limit=25):
+        words=s.split();out=[];line=''
         for word in words:
-            if len(line+' '+word)>limit and line:out.append(line);line=word
+            if len((line+' '+word).strip())>limit and line:
+                out.append(line);line=word
             else:line=(line+' '+word).strip()
         if line:out.append(line)
-        return out[:9]
+        return out[:6]
     lines=wrap(subtitle)
-    y=755
+    y=860+(6-len(lines))*12
     for line in lines:
-        box=d.textbbox((0,0),line,font=ft); x=(w-(box[2]-box[0]))/2
-        d.text((x,y),line,font=ft,fill=(255,250,235),stroke_width=1,stroke_fill=(20,20,25));y+=67
-    d.text((35,65),title[:32],font=fs,fill=(255,220,175))
-    d.text((35,1200),f'THANH NGUY AI STUDIO   •   {idx+1}/{total}',font=fs,fill=(230,230,230))
-    im.save(path)
+        bbox=d.textbbox((0,0),line,font=ft)
+        x=(w-(bbox[2]-bbox[0]))/2
+        d.text((x,y),line,font=ft,fill='white',stroke_width=2,stroke_fill=(0,0,0))
+        y+=65
+    d.text((28,40),title[:35],font=fs,fill='white')
+    d.text((28,1220),f'THANH NGUY AI STUDIO  •  {idx+1}/{total}',font=fs,fill='white')
+    im.convert('RGB').save(path)
 
 def run(args):
     result=subprocess.run(args,capture_output=True,text=True,timeout=240)
@@ -78,12 +117,21 @@ if submitted:
                 topic=topic.strip()[:140]
                 lines=[s.format(topic=topic) for s in TEMPLATES[genre]] if mode!='Tôi tự nhập lời đọc' else [x.strip() for x in custom.replace('\n',' ').split('.') if x.strip()]
                 lines=lines[:8]
+                uploaded=[]
+                for f in (photos or []):
+                    try: uploaded.append(Image.open(io.BytesIO(f.getvalue())).convert('RGB'))
+                    except Exception: pass
+                source_notes=[]
                 if len(lines)==0:raise ValueError('Không có nội dung để dựng.')
                 with tempfile.TemporaryDirectory() as td:
                     td=Path(td); ff=imageio_ffmpeg.get_ffmpeg_exe(); segments=[]
                     for i,line in enumerate(lines):
                         img=td/f'frame{i}.png'; audio=td/f'audio{i}.mp3'; out=td/f'seg{i}.mp4'
-                        frame(img,topic,line,i,len(lines))
+                        photo=uploaded[i%len(uploaded)] if uploaded else None
+                        if photo is None:
+                            photo,meta=commons_image(topic if i==0 else genre+' '+topic)
+                            if meta:source_notes.append(meta)
+                        frame(img,topic,line,i,len(lines),photo)
                         asyncio.run(speech(line,audio,voice))
                         run([ff,'-y','-loop','1','-framerate','25','-i',str(img),'-i',str(audio),'-vf','scale=720:1280,format=yuv420p','-c:v','libx264','-preset','ultrafast','-tune','stillimage','-c:a','aac','-b:a','128k','-shortest','-movflags','+faststart',str(out)])
                         segments.append(out)
@@ -95,7 +143,10 @@ if submitted:
                 st.video(video)
                 st.download_button('📥 TẢI VIDEO MP4',video,file_name='Thanh_Nguy_AI_Studio.mp4',mime='video/mp4',use_container_width=True)
                 st.download_button('📝 TẢI KỊCH BẢN','\n'.join(lines),file_name='kich_ban.txt',mime='text/plain')
-                st.info('Lưu ý: Bản này dùng kịch bản mẫu theo thể loại, nền đồ họa tự tạo và giọng đọc trực tuyến. Thời lượng thực tế theo lời đọc, có thể khác thời lượng mục tiêu. Chưa tích hợp AI tạo ảnh/video.')
+                if source_notes:
+                    st.caption('Nguồn ảnh Wikimedia Commons (kiểm tra giấy phép và ghi công trước khi đăng):')
+                    for item in {x['source']:x for x in source_notes}.values(): st.write(item['source']+' — '+item['license'])
+                st.info('Bản nâng cấp dùng ảnh em tải lên hoặc thử tìm ảnh từ Wikimedia Commons; nếu không tìm được sẽ dùng nền dự phòng. Chưa có AI tạo ảnh hay AI viết kịch bản. Thời lượng thực tế phụ thuộc lời đọc.')
         except Exception as e:
             st.error('Chưa thể xuất video: '+str(e))
             st.info('Kiểm tra kết nối Internet, giọng đọc Edge TTS và tài nguyên máy chủ. Thử nội dung ngắn hơn.')
